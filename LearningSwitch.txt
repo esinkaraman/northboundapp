@@ -1,0 +1,197 @@
+	/**
+	 * Processes a OFPacketIn message. If the switch has learned the MAC/VLAN to port mapping
+	 * for the pair it will write a FlowMod for. If the mapping has not been learned the
+	 * we will flood the packet.
+	 * @param sw
+	 * @param pi
+	 * @param cntx
+	 * @return
+	 */
+	private Command processPacketInMessage(IOFSwitch sw, OFPacketIn pi, FloodlightContext cntx) {
+		OFPort inPort = (pi.getVersion().compareTo(OFVersion.OF_12) < 0 ? pi.getInPort() : pi.getMatch().get(MatchField.IN_PORT));
+		
+		/* Read packet header attributes into Match */
+		Match m = createMatchFromPacket(sw, inPort, cntx);
+		MacAddress sourceMac = m.get(MatchField.ETH_SRC);
+		MacAddress destMac = m.get(MatchField.ETH_DST);
+		VlanVid vlan = m.get(MatchField.VLAN_VID) == null ? VlanVid.ZERO : m.get(MatchField.VLAN_VID).getVlanVid();
+
+		if (sourceMac == null) {
+			sourceMac = MacAddress.NONE;
+		}
+		if (destMac == null) {
+			destMac = MacAddress.NONE;
+		}
+		if (vlan == null) {
+			vlan = VlanVid.ZERO;
+		}
+
+		if ((destMac.getLong() & 0xfffffffffff0L) == 0x0180c2000000L) {
+			if (log.isTraceEnabled()) {
+				log.trace("ignoring packet addressed to 802.1D/Q reserved addr: switch {} vlan {} dest MAC {}",
+						new Object[]{ sw, vlan, destMac.toString() });
+			}
+			return Command.STOP;
+		}
+		if ((sourceMac.getLong() & 0x010000000000L) == 0) {
+			// If source MAC is a unicast address, learn the port for this MAC/VLAN
+			this.addToPortMap(sw, sourceMac, vlan, inPort);
+		}
+
+		// Now output flow-mod and/or packet
+		OFPort outPort = getFromPortMap(sw, destMac, vlan);
+		if (outPort == null) {
+			// If we haven't learned the port for the dest MAC/VLAN, flood it
+			// Don't flood broadcast packets if the broadcast is disabled.
+			// XXX For LearningSwitch this doesn't do much. The sourceMac is removed
+			//     from port map whenever a flow expires, so you would still see
+			//     a lot of floods.
+			this.writePacketOutForPacketIn(sw, pi, OFPort.FLOOD);
+		} else if (outPort.equals(inPort)) {
+			log.trace("ignoring packet that arrived on same port as learned destination:"
+					+ " switch {} vlan {} dest MAC {} port {}",
+					new Object[]{ sw, vlan, destMac.toString(), outPort.getPortNumber() });
+		} else {
+			// Add flow table entry matching source MAC, dest MAC, VLAN and input port
+			// that sends to the port we previously learned for the dest MAC/VLAN.  Also
+			// add a flow table entry with source and destination MACs reversed, and
+			// input and output ports reversed.  When either entry expires due to idle
+			// timeout, remove the other one.  This ensures that if a device moves to
+			// a different port, a constant stream of packets headed to the device at
+			// its former location does not keep the stale entry alive forever.
+			// FIXME: current HP switches ignore DL_SRC and DL_DST fields, so we have to match on
+			// NW_SRC and NW_DST as well
+			// We write FlowMods with Buffer ID none then explicitly PacketOut the buffered packet
+			this.pushPacket(sw, m, pi, outPort);
+			this.writeFlowMod(sw, OFFlowModCommand.ADD, OFBufferId.NO_BUFFER, m, outPort);
+			if (LEARNING_SWITCH_REVERSE_FLOW) {
+				Match.Builder mb = m.createBuilder();
+				mb.setExact(MatchField.ETH_SRC, m.get(MatchField.ETH_DST))                         
+				.setExact(MatchField.ETH_DST, m.get(MatchField.ETH_SRC))     
+				.setExact(MatchField.IN_PORT, outPort);
+				if (m.get(MatchField.VLAN_VID) != null) {
+					mb.setExact(MatchField.VLAN_VID, m.get(MatchField.VLAN_VID));
+				}
+
+				this.writeFlowMod(sw, OFFlowModCommand.ADD, OFBufferId.NO_BUFFER, mb.build(), inPort);
+			}
+		}
+		
+		/*
+		 * SWE599 - my logic is here
+		 */
+		 Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
+		if (eth.getEtherType() == EthType.IPv4) {
+			 IPv4 ipv4 = (IPv4) eth.getPayload();
+			if (ipv4.getProtocol().equals(IpProtocol.UDP)) {
+				UDP udp = (UDP) ipv4.getPayload();
+				  
+                /* Various getters and setters are exposed in UDP */
+                TransportPort dstPort = udp.getDestinationPort();
+                
+                if(dstPort.getPort() == 53) {
+                	
+                	IPacket payload = udp.getPayload();
+                	byte[] serialize = payload.serialize();
+                	
+                	log.info("==> <SWE599> THIS IS THE DNS packet from port " + inPort.getPortNumber());
+                	
+                	if(serialize.length>16) {
+                		int s = serialize.length-16;
+                		byte[] queryBytes = new byte[s];
+                		int lastInd = serialize.length-5;
+                		
+                		for (int i = 12,j=0; i < lastInd; i++,j++) {
+                			queryBytes[j] = serialize[i];
+//                			System.out.print(queryBytes[j] + ",");
+						}
+                		
+                		String hostname = byteToHostname(queryBytes);
+
+                		log.info("==> <SWE599> DNS query deserialized: " + hostname + " length=" + hostname.length());
+                		
+                		String requestJson = getRequestJson(hostname, 
+                				sw.getId().toString().trim(), 
+                				eth.getSourceMACAddress().toString(), 
+                				String.valueOf(inPort.getPortNumber()));
+                		
+                		postXml(requestJson);
+                	}
+                }
+			}
+		}
+		return Command.CONTINUE;
+		}
+		
+			private static void postXml(String json){
+		try{
+			String URL = "http://localhost:8000/nb";
+			URL url = new URL(URL);
+            URLConnection connection = url.openConnection();
+            connection.setDoOutput(true);
+            OutputStreamWriter out = new OutputStreamWriter(connection.getOutputStream(),"utf-8");
+            
+            System.out.println("==> <SWE599> POSTING " + json + " to " + URL);
+            out.write(json);
+            
+            out.close();
+    
+            BufferedReader in = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+            
+            String response;
+            while ((response = in.readLine()) != null) {
+                System.out.println("==> <SWE599> Response received: "+response);
+            }
+            in.close();
+        }catch (Throwable e) {
+            e.printStackTrace();
+        }
+	}
+	
+	private static String requestStr = "\"queryString\":\"{0}\",\"switchId\":\"{1}\",\"clientMAC\":\"{2}\",\"ingressPort\":\"{3}\"";
+	
+	private String getRequestJson(String query, String switchId, String clientMAC, String ingressPort){
+		MessageFormat formatter = new MessageFormat (requestStr);
+        String request = formatter.format (new Object[] {query, switchId, clientMAC, ingressPort});
+        return "{"+request+"}";
+	}
+	/**
+	 * @author esin
+	 * @param arr
+	 */
+	private String byteToHostname(byte[] arr) {
+		int from = 0;
+		int to = 0;
+		StringBuilder sb = new StringBuilder();
+		while(to < arr.length) {
+			if(to != 0) {
+				sb.append(".");
+			}
+			from = to + 1;
+			to = from + arr[to];
+			sb.append(getSubString(arr, from, to));
+		}
+		String hostname = sb.toString();
+		if(hostname.endsWith(".")){
+			return hostname.substring(0, hostname.length()-1);
+		}
+		return hostname;
+	}
+	
+	/**
+	 * @author esin
+	 * @param arr
+	 * @param from
+	 * @param to
+	 * @return
+	 */
+	private String getSubString(byte[] arr, int from, int to) {
+		int dimension = to-from;
+		byte[] subarr = new byte[dimension];
+		
+		for (int i = from,j=0; i < to; i++,j++) {
+			subarr[j] = arr[i];
+		}
+		return new String(subarr);
+	}
+		
